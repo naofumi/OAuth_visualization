@@ -26,7 +26,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Remove previous Pages artifacts from this run
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const artifacts = await github.paginate(
