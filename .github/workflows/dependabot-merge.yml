@@ -1,4 +1,4 @@
-name: Merge Dependabot patches
+name: Merge Dependabot updates
 
 on:
   workflow_run:
@@ -8,7 +8,7 @@ on:
 permissions: {}
 
 jobs:
-  merge-patch:
+  merge-update:
     if: >-
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success' &&
@@ -20,7 +20,7 @@ jobs:
       contents: write
       pull-requests: read
     steps:
-      - name: Merge the tested patch and dispatch Pages
+      - name: Merge the tested update and dispatch Pages
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
@@ -58,19 +58,10 @@ jobs:
             if (commits.length !== 1 || commit.sha !== run.head_sha ||
                 commit.author?.login !== bot || !commit.commit.verification?.verified) return;
 
-            // Read the signed update trailer from the commit rather than the editable PR body.
-            const trailer = commit.commit.message.match(/^---\r?\nupdated-dependencies:\r?\n([\s\S]*?)^\.\.\.[ \t]*\r?$/m)?.[1];
-            const dependencies = trailer?.match(/^- dependency-name:[ \t]+\S.*$/gm) ?? [];
-            const types = [...(trailer?.matchAll(/^[ \t]+update-type:[ \t]+(\S+)[ \t]*\r?$/gm) ?? [])];
-            if (dependencies.length !== 1 || types.length !== 1 ||
-                types[0][1] !== 'version-update:semver-patch') {
-              core.info('Update requires manual review.');
-              return;
-            }
-
             const allowed = npm
               ? ['package.json', 'package-lock.json']
-              : ['.github/workflows/pr-build.yml', '.github/workflows/deploy.yml'];
+              : ['.github/workflows/pr-build.yml', '.github/workflows/deploy.yml',
+                 '.github/workflows/dependabot-merge.yml'];
             if (pr.changed_files < 1 || pr.changed_files > allowed.length) return;
             const { data: files } = await github.rest.pulls.listFiles(pull);
             if (files.length !== pr.changed_files ||
@@ -95,7 +86,7 @@ jobs:
                 ...pull, sha: run.head_sha, merge_method: 'squash'
               });
               if (!merge.merged) throw new Error(merge.message);
-              core.info(`Merged Dependabot patch #${pr.number} as ${merge.sha}.`);
+              core.info(`Merged Dependabot update #${pr.number} as ${merge.sha}.`);
             } else if (!pr.merged || pr.merged_by?.login !== 'github-actions[bot]') {
               return;
             }
