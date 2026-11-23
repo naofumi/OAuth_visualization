@@ -1,0 +1,107 @@
+name: Merge Dependabot patches
+
+on:
+  workflow_run:
+    workflows: [Pull request build]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  merge-patch:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.id == github.event.repository.id &&
+      github.event.workflow_run.actor.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Merge the tested patch and dispatch Pages
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const repository = context.payload.repository;
+            const run = context.payload.workflow_run;
+            const bot = 'dependabot[bot]';
+
+            if (run.path !== '.github/workflows/pr-build.yml' ||
+                run.head_repository?.id !== repository.id ||
+                run.actor?.login !== bot || !run.head_sha) return;
+
+            const npm = run.head_branch?.startsWith('dependabot/npm_and_yarn/');
+            const actions = run.head_branch?.startsWith('dependabot/github_actions/');
+            if (!npm && !actions) return;
+
+            const { data: candidates } = await github.rest.pulls.list({
+              owner, repo, state: 'all', head: `${owner}:${run.head_branch}`, base: 'main'
+            });
+            const matchesBuild = pr =>
+              pr.user?.login === bot && pr.user?.type === 'Bot' &&
+              pr.base.ref === 'main' && pr.base.repo?.id === repository.id &&
+              pr.head.repo?.id === repository.id && pr.head.ref === run.head_branch &&
+              pr.head.sha === run.head_sha;
+
+            const candidate = candidates.find(matchesBuild);
+            if (!candidate) return;
+
+            const pull = { owner, repo, pull_number: candidate.number };
+            const { data: pr } = await github.rest.pulls.get(pull);
+            if (!matchesBuild(pr) || pr.draft || pr.commits !== 1) return;
+
+            const { data: commits } = await github.rest.pulls.listCommits(pull);
+            const [commit] = commits;
+            if (commits.length !== 1 || commit.sha !== run.head_sha ||
+                commit.author?.login !== bot || !commit.commit.verification?.verified) return;
+
+            // Read the signed update trailer from the commit rather than the editable PR body.
+            const trailer = commit.commit.message.match(/^---\r?\nupdated-dependencies:\r?\n([\s\S]*?)^\.\.\.[ \t]*\r?$/m)?.[1];
+            const dependencies = trailer?.match(/^- dependency-name:[ \t]+\S.*$/gm) ?? [];
+            const types = [...(trailer?.matchAll(/^[ \t]+update-type:[ \t]+(\S+)[ \t]*\r?$/gm) ?? [])];
+            if (dependencies.length !== 1 || types.length !== 1 ||
+                types[0][1] !== 'version-update:semver-patch') {
+              core.info('Update requires manual review.');
+              return;
+            }
+
+            const allowed = npm
+              ? ['package.json', 'package-lock.json']
+              : ['.github/workflows/pr-build.yml', '.github/workflows/deploy.yml'];
+            if (pr.changed_files < 1 || pr.changed_files > allowed.length) return;
+            const { data: files } = await github.rest.pulls.listFiles(pull);
+            if (files.length !== pr.changed_files ||
+                files.some(file => file.status !== 'modified' || !allowed.includes(file.filename))) return;
+
+            const { data: { jobs } } = await github.rest.actions.listJobsForWorkflowRunAttempt({
+              owner, repo, run_id: run.id, attempt_number: run.run_attempt
+            });
+            const builds = jobs.filter(job => job.name === 'npm-build');
+            if (builds.length !== 1 || builds[0].conclusion !== 'success') return;
+
+            if (pr.state === 'open') {
+              const { data: { workflow_runs: [latest] } } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: run.workflow_id, event: 'pull_request',
+                branch: run.head_branch, head_sha: run.head_sha, per_page: 1
+              });
+              if (latest?.id !== run.id || latest.run_attempt !== run.run_attempt ||
+                  latest.conclusion !== 'success') return;
+
+              // GitHub still enforces the branch rules, and this SHA prevents a head-change race.
+              const { data: merge } = await github.rest.pulls.merge({
+                ...pull, sha: run.head_sha, merge_method: 'squash'
+              });
+              if (!merge.merged) throw new Error(merge.message);
+              core.info(`Merged Dependabot patch #${pr.number} as ${merge.sha}.`);
+            } else if (!pr.merged || pr.merged_by?.login !== 'github-actions[bot]') {
+              return;
+            }
+
+            // The built-in token's merge does not trigger push workflows. Dispatch Pages explicitly.
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: 'deploy.yml', ref: 'main'
+            });
+            core.info('Dispatched GitHub Pages deployment.');
